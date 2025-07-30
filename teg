@@ -1,0 +1,198 @@
+import logging
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import requests
+from bs4 import BeautifulSoup
+import re
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = "8344260394:AAGcqbk73305XmakKK3HQtEu0IeVsFFYvNM"
+
+class PowerOutageBot:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        welcome_text = (
+            f"سلام {user.first_name}! 👋\n\n"
+            "به ربات جستجوی برنامه قطعی برق خوش آمدید.\n\n"
+            "لطفاً نام کوچه یا خیابان محل زندگی خود را ارسال کنید:"
+        )
+        
+        await update.message.reply_text(welcome_text)
+    
+    def search_power_outages(self, street_name):
+        try:
+            url = "https://khamooshi.maztozi.ir"
+            response = self.session.get(url)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            form = soup.find('form')
+            if not form:
+                return "خطا: فرم جستجو یافت نشد"
+            
+            # Prepare form data
+            form_data = {}
+            
+            # Find all input fields in the form
+            inputs = form.find_all(['input', 'select'])
+            for input_field in inputs:
+                name = input_field.get('name')
+                if name:
+                    if input_field.name == 'select':
+                        # Handle select fields
+                        if 'province' in name.lower() or 'استان' in str(input_field):
+                            # Find the option for Sari (ساری)
+                            options = input_field.find_all('option')
+                            for option in options:
+                                if 'ساری' in option.text or 'sari' in option.text.lower():
+                                    form_data[name] = option.get('value', 'ساری')
+                                    break
+                        elif 'city' in name.lower() or 'شهر' in str(input_field):
+                            form_data[name] = 'ساری'
+                    elif input_field.get('type') == 'text':
+                        if 'location' in name.lower() or 'مکان' in str(input_field):
+                            form_data[name] = street_name
+                    elif input_field.get('type') == 'hidden':
+                        form_data[name] = input_field.get('value', '')
+            
+            # Add the street name to location field
+            form_data['location'] = street_name
+            form_data['city'] = 'ساری'
+            
+            # Submit the form
+            action = form.get('action', '')
+            if not action.startswith('http'):
+                action = url + action
+            
+            search_response = self.session.post(action, data=form_data)
+            search_response.raise_for_status()
+            
+            # Parse the results
+            results_soup = BeautifulSoup(search_response.content, 'html.parser')
+            
+            # Look for results (this may need adjustment based on actual HTML structure)
+            results = []
+            
+            # Try to find result containers (adjust selectors based on actual website)
+            result_containers = results_soup.find_all(['div', 'tr', 'li'], 
+                                                    class_=re.compile(r'result|item|row', re.I))
+            
+            if not result_containers:
+                # Fallback: look for any element containing the street name
+                result_containers = results_soup.find_all(text=re.compile(street_name, re.I))
+                result_containers = [elem.parent for elem in result_containers if elem.parent]
+            
+            for container in result_containers[:10]:  # Limit to 10 results
+                text = container.get_text(strip=True)
+                if street_name in text:
+                    # Try to extract address and time information
+                    lines = text.split('\n')
+                    address = ""
+                    time_info = ""
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if line:
+                            if any(keyword in line for keyword in ['خیابان', 'کوچه', 'آدرس']):
+                                address = line
+                            elif any(keyword in line for keyword in ['ساعت', 'زمان', 'قطعی']):
+                                time_info = line
+                    
+                    if address or time_info:
+                        results.append({
+                            'address': address or text[:100],
+                            'time': time_info or 'زمان مشخص نشده'
+                        })
+            
+            return results
+            
+        except requests.RequestException as e:
+            logger.error(f"Request error: {e}")
+            return f"خطا در دسترسی به وب‌سایت: {str(e)}"
+        except Exception as e:
+            logger.error(f"General error: {e}")
+            return f"خطا: {str(e)}"
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle user messages (street names)"""
+        street_name = update.message.text.strip()
+        
+        if not street_name:
+            await update.message.reply_text("لطفاً نام کوچه یا خیابان را وارد کنید.")
+            return
+        
+        # Send "searching" message
+        searching_msg = await update.message.reply_text(
+            f"🔍 در حال جستجوی برنامه قطعی برق برای: {street_name}\n"
+            "لطفاً کمی صبر کنید..."
+        )
+        
+        # Search for power outages
+        results = self.search_power_outages(street_name)
+        
+        # Delete searching message
+        await searching_msg.delete()
+        
+        if isinstance(results, str):
+            # Error message
+            await update.message.reply_text(f"❌ {results}")
+        elif not results:
+            await update.message.reply_text(
+                f"❌ هیچ نتیجه‌ای برای '{street_name}' یافت نشد.\n"
+                "لطفاً نام کوچه یا خیابان را دقیق‌تر وارد کنید."
+            )
+        else:
+            # Format and send results
+            response_text = f"📍 نتایج برای '{street_name}':\n\n"
+            
+            for i, result in enumerate(results, 1):
+                response_text += f"{i}. 📍 آدرس: {result['address']}\n"
+                response_text += f"   ⏰ زمان قطعی: {result['time']}\n\n"
+            
+            # Split long messages if needed
+            if len(response_text) > 4000:
+                parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(response_text)
+        
+        # Ask for another search
+        await update.message.reply_text(
+            "برای جستجوی مجدد، نام کوچه یا خیابان جدید را ارسال کنید."
+        )
+
+def main():
+    """Start the bot"""
+    # Create bot instance
+    bot = PowerOutageBot()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    
+    # Start the bot
+    print("Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
