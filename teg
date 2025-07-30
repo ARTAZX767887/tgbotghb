@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8344260394:AAGcqbk73305XmakKK3HQtEu0IeVsFFYvNM"
+BOT_TOKEN = "8-VsF-"
 
 class PowerOutageBot:
     def __init__(self):
