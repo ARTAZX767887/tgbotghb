@@ -1,198 +1,491 @@
-import logging
 import asyncio
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import requests
-from bs4 import BeautifulSoup
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import re
-import urllib3
+from typing import List, Dict
+import json
+import os
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+    level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8-VsF-"
 
-class PowerOutageBot:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        welcome_text = (
-            f"سلام {user.first_name}! 👋\n\n"
-            "به ربات جستجوی برنامه قطعی برق خوش آمدید.\n\n"
-            "لطفاً نام کوچه یا خیابان محل زندگی خود را ارسال کنید:"
-        )
-        
-        await update.message.reply_text(welcome_text)
-    
-    def search_power_outages(self, street_name):
-        try:
-            url = "https://khamooshi.maztozi.ir"
-            response = self.session.get(url)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            form = soup.find('form')
-            if not form:
-                return "خطا: فرم جستجو یافت نشد"
-            
-            # Prepare form data
-            form_data = {}
-            
-            # Find all input fields in the form
-            inputs = form.find_all(['input', 'select'])
-            for input_field in inputs:
-                name = input_field.get('name')
-                if name:
-                    if input_field.name == 'select':
-                        # Handle select fields
-                        if 'province' in name.lower() or 'استان' in str(input_field):
-                            # Find the option for Sari (ساری)
-                            options = input_field.find_all('option')
-                            for option in options:
-                                if 'ساری' in option.text or 'sari' in option.text.lower():
-                                    form_data[name] = option.get('value', 'ساری')
-                                    break
-                        elif 'city' in name.lower() or 'شهر' in str(input_field):
-                            form_data[name] = 'ساری'
-                    elif input_field.get('type') == 'text':
-                        if 'location' in name.lower() or 'مکان' in str(input_field):
-                            form_data[name] = street_name
-                    elif input_field.get('type') == 'hidden':
-                        form_data[name] = input_field.get('value', '')
-            
-            # Add the street name to location field
-            form_data['location'] = street_name
-            form_data['city'] = 'ساری'
-            
-            # Submit the form
-            action = form.get('action', '')
-            if not action.startswith('http'):
-                action = url + action
-            
-            search_response = self.session.post(action, data=form_data)
-            search_response.raise_for_status()
-            
-            # Parse the results
-            results_soup = BeautifulSoup(search_response.content, 'html.parser')
-            
-            # Look for results (this may need adjustment based on actual HTML structure)
-            results = []
-            
-            # Try to find result containers (adjust selectors based on actual website)
-            result_containers = results_soup.find_all(['div', 'tr', 'li'], 
-                                                    class_=re.compile(r'result|item|row', re.I))
-            
-            if not result_containers:
-                # Fallback: look for any element containing the street name
-                result_containers = results_soup.find_all(text=re.compile(street_name, re.I))
-                result_containers = [elem.parent for elem in result_containers if elem.parent]
-            
-            for container in result_containers[:10]:  # Limit to 10 results
-                text = container.get_text(strip=True)
-                if street_name in text:
-                    # Try to extract address and time information
-                    lines = text.split('\n')
-                    address = ""
-                    time_info = ""
-                    
-                    for line in lines:
-                        line = line.strip()
-                        if line:
-                            if any(keyword in line for keyword in ['خیابان', 'کوچه', 'آدرس']):
-                                address = line
-                            elif any(keyword in line for keyword in ['ساعت', 'زمان', 'قطعی']):
-                                time_info = line
-                    
-                    if address or time_info:
-                        results.append({
-                            'address': address or text[:100],
-                            'time': time_info or 'زمان مشخص نشده'
-                        })
-            
-            return results
-            
-        except requests.RequestException as e:
-            logger.error(f"Request error: {e}")
-            return f"خطا در دسترسی به وب‌سایت: {str(e)}"
-        except Exception as e:
-            logger.error(f"General error: {e}")
-            return f"خطا: {str(e)}"
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle user messages (street names)"""
-        street_name = update.message.text.strip()
-        
-        if not street_name:
-            await update.message.reply_text("لطفاً نام کوچه یا خیابان را وارد کنید.")
+class AddressBot:
+
+    def __init__(self, token: str, admin_id: int):
+        self.token = token
+        self.admin_id = admin_id
+        self.addresses = []
+        self.data_file = "addresses.json"
+        self.txt_files_dir = "data"
+        self.create_data_directory()
+        self.load_addresses_from_txt()
+
+    def create_data_directory(self):
+        if not os.path.exists(self.txt_files_dir):
+            os.makedirs(self.txt_files_dir)
+            logger.info(f"Created data directory: {self.txt_files_dir}")
+
+    def load_addresses_from_txt(self):
+        self.addresses = []
+        if not os.path.exists(self.txt_files_dir):
+            logger.warning(
+                f"Data directory {self.txt_files_dir} does not exist")
             return
-        
-        # Send "searching" message
-        searching_msg = await update.message.reply_text(
-            f"🔍 در حال جستجوی برنامه قطعی برق برای: {street_name}\n"
-            "لطفاً کمی صبر کنید..."
-        )
-        
-        # Search for power outages
-        results = self.search_power_outages(street_name)
-        
-        # Delete searching message
-        await searching_msg.delete()
-        
-        if isinstance(results, str):
-            # Error message
-            await update.message.reply_text(f"❌ {results}")
-        elif not results:
-            await update.message.reply_text(
-                f"❌ هیچ نتیجه‌ای برای '{street_name}' یافت نشد.\n"
-                "لطفاً نام کوچه یا خیابان را دقیق‌تر وارد کنید."
-            )
-        else:
-            # Format and send results
-            response_text = f"📍 نتایج برای '{street_name}':\n\n"
-            
-            for i, result in enumerate(results, 1):
-                response_text += f"{i}. 📍 آدرس: {result['address']}\n"
-                response_text += f"   ⏰ زمان قطعی: {result['time']}\n\n"
-            
-            # Split long messages if needed
-            if len(response_text) > 4000:
-                parts = [response_text[i:i+4000] for i in range(0, len(response_text), 4000)]
-                for part in parts:
-                    await update.message.reply_text(part)
+
+        txt_files = [
+            f for f in os.listdir(self.txt_files_dir) if f.endswith('.txt')
+        ]
+        if not txt_files:
+            logger.info("No .txt files found in data directory")
+            return
+
+        for txt_file in txt_files:
+            file_path = os.path.join(self.txt_files_dir, txt_file)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    file_addresses = self.parse_addresses(content)
+                    self.addresses.extend(file_addresses)
+                    logger.info(
+                        f"Loaded {len(file_addresses)} addresses from {txt_file}"
+                    )
+            except Exception as e:
+                logger.error(f"Error reading file {txt_file}: {e}")
+
+        logger.info(f"Total addresses loaded: {len(self.addresses)}")
+        self.save_addresses()
+
+    def reload_data(self):
+        self.load_addresses_from_txt()
+
+    def get_txt_files_info(self):
+        if not os.path.exists(self.txt_files_dir):
+            return []
+
+        txt_files = [
+            f for f in os.listdir(self.txt_files_dir) if f.endswith('.txt')
+        ]
+        files_info = []
+        for txt_file in txt_files:
+            file_path = os.path.join(self.txt_files_dir, txt_file)
+            try:
+                stat = os.stat(file_path)
+                files_info.append({
+                    'name': txt_file,
+                    'size': stat.st_size,
+                    'modified': stat.st_mtime
+                })
+            except Exception as e:
+                logger.error(f"Error getting info for {txt_file}: {e}")
+        return files_info
+
+    def save_addresses(self):
+        try:
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(self.addresses, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(self.addresses)} addresses to file")
+        except Exception as e:
+            logger.error(f"Error saving addresses: {e}")
+
+    def parse_addresses(self, text: str) -> List[Dict]:
+        addresses = []
+        lines = text.strip().split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 4:
+                date = parts[0].strip()
+                start_time = parts[1].strip()
+                end_time = parts[2].strip()
+                category = parts[3].strip()
+                address = parts[4].strip() if len(parts) > 4 else ""
+                addresses.append({
+                    'date': date,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'category': category,
+                    'address': address,
+                    'full_text': line
+                })
+                logger.debug(f"Parsed address: {address}")
+        return addresses
+
+    def search_addresses(self, query: str) -> List[Dict]:
+        """Search for addresses containing all words in the query string"""
+        results = []
+        query_words = [
+            word.strip().lower() for word in query.split() if word.strip()
+        ]
+        if not query_words:
+            logger.warning("Empty query received")
+            return results
+
+        logger.info(f"Searching for query: {query_words}")
+        for addr in self.addresses:
+            address_lower = addr['address'].lower()
+            # Check if all query words are present in the address
+            if all(word in address_lower for word in query_words):
+                results.append(addr)
+                logger.debug(f"Match found: {addr['address']}")
             else:
-                await update.message.reply_text(response_text)
-        
-        # Ask for another search
+                logger.debug(
+                    f"No match for {addr['address']} with query {query_words}")
+        logger.info(f"Found {len(results)} matches for query: {query_words}")
+        return results
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id == self.admin_id
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if self.is_admin(user_id):
+            files_info = self.get_txt_files_info()
+            files_count = len(files_info)
+            welcome_message = f"""
+🔧 سلام ادمین عزیز!
+
+شما می‌توانید:
+/reload - بارگذاری مجدد فایل‌های .txt
+/files - نمایش فایل‌های موجود
+/status - وضعیت داده‌ها
+/help - راهنما
+
+📁 فایل‌های .txt: {files_count}
+📊 داده‌های بارگذاری شده: {len(self.addresses)} آدرس
+
+💡 برای افزودن داده جدید، فایل .txt را آپلود کنید و /reload بزنید.
+            """
+        else:
+            if len(self.addresses) == 0:
+                welcome_message = """
+❌ متاسفانه هنوز داده‌ای در سیستم وجود ندارد.
+لطفاً بعداً مراجعه کنید.
+                """
+            else:
+                welcome_message = """
+🔍 سلام! به ربات جستجوی قطعی برق خوش آمدید
+
+برای جستجو، نام خیابان، کوچه یا منطقه را بنویسید. می‌توانید چند کلمه وارد کنید (مثال: "پاسداران بهار").
+
+مثال: "خزر" یا "پاسداران بهار" یا "معلم"
+
+📊 تعداد آدرس‌های موجود: {}
+                """.format(len(self.addresses))
+        await update.message.reply_text(welcome_message)
+
+    async def help_command(self, update: Update,
+                           context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if self.is_admin(user_id):
+            help_text = """
+📖 راهنمای ادمین:
+
+🔧 دستورات ادمین:
+/reload - بارگذاری مجدد فایل‌های .txt
+/files - نمایش لیست فایل‌های موجود
+/status - نمایش وضعیت و آمار داده‌ها
+
+📁 نحوه افزودن داده:
+1. فایل .txt را مستقیماً در ربات آپلود کنید
+2. دستور /reload را بزنید
+3. ربات فایل‌های آپلود شده را پردازش می‌کند
+
+📊 فرمت فایل .txt:
+هر خط: تاریخ [TAB] زمان_شروع [TAB] زمان_پایان [TAB] دسته [TAB] آدرس
+            """
+        else:
+            help_text = """
+📖 راهنمای کاربران:
+
+🔍 نحوه جستجو:
+- نام خیابان، کوچه یا منطقه را بنویسید
+- برای جستجوی دقیق‌تر، چند کلمه وارد کنید (مثال: "پاسداران بهار")
+- روی نتایج کلیک کنید تا جزئیات را ببینید
+
+💡 نکات:
+- می‌توانید بخشی از نام را بنویسید
+- جستجو حساس به حروف کوچک/بزرگ نیست
+- چند کلمه را با فاصله وارد کنید تا آدرس‌هایی که شامل همه آن‌ها هستند نمایش داده شوند
+            """
+        await update.message.reply_text(help_text)
+
+    async def reload_command(self, update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not self.is_admin(user_id):
+            await update.message.reply_text(
+                "❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        await update.message.reply_text("🔄 در حال بارگذاری مجدد فایل‌ها...")
+        old_count = len(self.addresses)
+        self.reload_data()
+        new_count = len(self.addresses)
+        files_info = self.get_txt_files_info()
+        message = f"""
+✅ بارگذاری مجدد کامل شد!
+
+📊 آمار:
+• آدرس‌های قبلی: {old_count}
+• آدرس‌های جدید: {new_count}
+• تغییرات: {new_count - old_count:+d}
+• فایل‌های .txt: {len(files_info)}
+
+📁 فایل‌های پردازش شده:
+"""
+        for file_info in files_info:
+            message += f"• {file_info['name']} ({file_info['size']} بایت)\n"
+        await update.message.reply_text(message)
+
+    async def files_command(self, update: Update,
+                            context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not self.is_admin(user_id):
+            await update.message.reply_text(
+                "❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        files_info = self.get_txt_files_info()
+        if not files_info:
+            await update.message.reply_text("""
+📁 هیچ فایل .txt در پوشه 'data' یافت نشد.
+
+💡 برای افزودن داده:
+1. فایل .txt را آپلود کنید
+2. دستور /reload را بزنید
+            """)
+            return
+        import time
+        message = f"📁 فایل‌های .txt موجود ({len(files_info)} فایل):\n\n"
+        for file_info in files_info:
+            modified_date = time.strftime(
+                '%Y/%m/%d %H:%M', time.localtime(file_info['modified']))
+            size_kb = file_info['size'] / 1024
+            message += f"""
+📄 {file_info['name']}
+   📊 حجم: {size_kb:.1f} کیلوبایت
+   📅 آخرین تغییر: {modified_date}
+"""
+        message += f"\n💡 برای بارگذاری مجدد: /reload"
+        await update.message.reply_text(message)
+
+    async def status_command(self, update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not self.is_admin(user_id):
+            await update.message.reply_text(
+                "❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        dates = {}
+        for addr in self.addresses:
+            date = addr['date']
+            dates[date] = dates.get(date, 0) + 1
+        files_info = self.get_txt_files_info()
+        status_text = f"""
+📊 وضعیت سیستم:
+
+🔢 تعداد کل آدرس‌ها: {len(self.addresses)}
+📅 تعداد روزها: {len(dates)}
+📁 فایل‌های .txt: {len(files_info)}
+
+📈 آمار روزانه:
+"""
+        for date, count in sorted(dates.items()):
+            status_text += f"• {date}: {count} آدرس\n"
+        if files_info:
+            status_text += f"\n📁 فایل‌های موجود:\n"
+            for file_info in files_info:
+                status_text += f"• {file_info['name']}\n"
+        await update.message.reply_text(status_text)
+
+    async def clear_data(self, update: Update,
+                         context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not self.is_admin(user_id):
+            await update.message.reply_text(
+                "❌ شما مجاز به استفاده از این دستور نیستید.")
+            return
+        txt_files = [
+            f for f in os.listdir(self.txt_files_dir) if f.endswith('.txt')
+        ]
+        for txt_file in txt_files:
+            try:
+                os.remove(os.path.join(self.txt_files_dir, txt_file))
+                logger.info(f"Deleted file: {txt_file}")
+            except Exception as e:
+                logger.error(f"Error deleting file {txt_file}: {e}")
+        self.addresses = []
+        self.save_addresses()
+        await update.message.reply_text("""
+✅ داده‌ها و فایل‌های .txt پاک شدند.
+
+💡 برای افزودن داده جدید، فایل .txt آپلود کنید و /reload بزنید.
+        """)
+
+    async def cancel_command(self, update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        await update.message.reply_text("✅ عملیات لغو شد.")
+
+    async def handle_file_upload(self, update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not self.is_admin(user_id):
+            await update.message.reply_text("❌ شما مجاز به آپلود فایل نیستید.")
+            return
+        document = update.message.document
+        if not document.file_name.endswith('.txt'):
+            await update.message.reply_text("❌ لطفاً فقط فایل .txt آپلود کنید."
+                                            )
+            return
+        try:
+            file = await document.get_file()
+            file_path = os.path.join(self.txt_files_dir, document.file_name)
+            counter = 1
+            base_name, ext = os.path.splitext(document.file_name)
+            while os.path.exists(file_path):
+                new_name = f"{base_name}_{counter}{ext}"
+                file_path = os.path.join(self.txt_files_dir, new_name)
+                counter += 1
+            await file.download_to_drive(file_path)
+            logger.info(f"File saved: {file_path}")
+            await update.message.reply_text(f"""
+✅ فایل "{document.file_name}" با موفقیت آپلود شد.
+
+📊 حجم: {document.file_size} بایت
+💡 برای پردازش فایل: /reload
+            """)
+        except Exception as e:
+            logger.error(f"Error handling file upload: {e}")
+            await update.message.reply_text(
+                "❌ خطا در آپلود فایل. لطفاً دوباره امتحان کنید.")
+
+    async def handle_message(self, update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        text = update.message.text
+
+        if len(self.addresses) == 0:
+            await update.message.reply_text("""
+❌ متاسفانه هنوز داده‌ای در سیستم وجود ندارد.
+
+💡 اگر ادمین هستید، فایل .txt آپلود کرده و /reload بزنید.
+            """)
+            return
+
+        results = self.search_addresses(text)
+        if not results:
+            query_words = [
+                word.strip() for word in text.split() if word.strip()
+            ]
+            await update.message.reply_text(f"""
+❌ آدرسی با عبارت "{text}" یافت نشد.
+
+💡 پیشنهادات:
+• مطمئن شوید همه کلمات جستجو ({query_words}) در آدرس موجود باشند
+• کلمه یا کلمات دیگری امتحان کنید (مثال: "پاسداران بهار")
+• بخشی از نام خیابان یا منطقه را بنویسید
+• از کلمات کلیدی مثل "خزر"، "پاسداران"، "بهار" استفاده کنید
+            """)
+            return
+
+        if len(results) > 20:
+            await update.message.reply_text(f"""
+⚠️ تعداد نتایج زیاد است ({len(results)} نتیجه)
+
+لطفاً عبارت دقیق‌تری وارد کنید (مثال: "پاسداران بهار").
+            """)
+            return
+
+        keyboard = []
+        for i, addr in enumerate(results[:20]):
+            preview = addr['address'][:50] + "..." if len(
+                addr['address']) > 50 else addr['address']
+            button_text = f"📍 {addr['date']} - {preview}"
+            keyboard.append(
+                [InlineKeyboardButton(button_text, callback_data=f"addr_{i}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.user_data['search_results'] = results
         await update.message.reply_text(
-            "برای جستجوی مجدد، نام کوچه یا خیابان جدید را ارسال کنید."
-        )
+            f"🔍 {len(results)} نتیجه برای \"{text}\" یافت شد:\n\nروی آدرس مورد نظر کلیک کنید:",
+            reply_markup=reply_markup)
 
-def main():
-    """Start the bot"""
-    # Create bot instance
-    bot = PowerOutageBot()
-    
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Start the bot
-    print("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    async def button_callback(self, update: Update,
+                              context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if query.data.startswith("addr_"):
+            index = int(query.data.split("_")[1])
+            results = context.user_data.get('search_results', [])
+            if index < len(results):
+                addr = results[index]
+                response = f"""
+📍 جزئیات آدرس:
 
-if __name__ == '__main__':
-    main()
+📅 تاریخ: {addr['date']}
+🕐 زمان شروع: {addr['start_time']}
+🕕 زمان پایان: {addr['end_time']}
+🏷️ دسته‌بندی: {addr['category']}
+🗺️ آدرس: {addr['address']}
+                """
+                # Add Return button
+                keyboard = [[
+                    InlineKeyboardButton("بازگشت", callback_data="return")
+                ]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(response,
+                                              reply_markup=reply_markup)
+        elif query.data == "return":
+            results = context.user_data.get('search_results', [])
+            if results:
+                keyboard = []
+                for i, addr in enumerate(results[:20]):
+                    preview = addr['address'][:50] + "..." if len(
+                        addr['address']) > 50 else addr['address']
+                    button_text = f"📍 {addr['date']} - {preview}"
+                    keyboard.append([
+                        InlineKeyboardButton(button_text,
+                                             callback_data=f"addr_{i}")
+                    ])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"🔍 {len(results)} نتیجه یافت شد:\n\nروی آدرس مورد نظر کلیک کنید:",
+                    reply_markup=reply_markup)
+
+    def run(self):
+        self.application = Application.builder().token(self.token).build()
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(
+            CommandHandler("reload", self.reload_command))
+        self.application.add_handler(
+            CommandHandler("files", self.files_command))
+        self.application.add_handler(
+            CommandHandler("status", self.status_command))
+        self.application.add_handler(CommandHandler("clear", self.clear_data))
+        self.application.add_handler(
+            CommandHandler("cancel", self.cancel_command))
+        self.application.add_handler(CallbackQueryHandler(
+            self.button_callback))
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND,
+                           self.handle_message))
+        self.application.add_handler(
+            MessageHandler(filters.Document.FileExtension("txt"),
+                           self.handle_file_upload))
+        print("🤖 Bot is starting...")
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+# Configuration
+BOT_TOKEN = "8231267816:AAHRHalMg0zyDT5FAiTDB04rIR1HFQlmrt4"
+ADMIN_USER_ID = 699591084
+
+if __name__ == "__main__":
+    bot = AddressBot(BOT_TOKEN, ADMIN_USER_ID)
+    bot.run()
